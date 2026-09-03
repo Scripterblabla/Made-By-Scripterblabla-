@@ -1,0 +1,555 @@
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local CurrentCamera = workspace.CurrentCamera
+local Debris = game:GetService("Debris")
+
+local CONFIG = {
+	DistanceZ = -0.5,
+	OffsetX   = 0,
+	OffsetY   = 0,
+	RotationY = -180
+}
+
+local EasingStyleMap = {
+	[Enum.PoseEasingStyle.Linear]   = Enum.EasingStyle.Linear,
+	[Enum.PoseEasingStyle.Bounce]   = Enum.EasingStyle.Bounce,
+	[Enum.PoseEasingStyle.Cubic]    = Enum.EasingStyle.Cubic,
+	[Enum.PoseEasingStyle.Elastic]  = Enum.EasingStyle.Elastic,
+	[Enum.PoseEasingStyle.Constant] = Enum.EasingStyle.Linear,
+}
+
+local EasingDirectionMap = {
+	[Enum.PoseEasingDirection.In]    = Enum.EasingDirection.In,
+	[Enum.PoseEasingDirection.Out]   = Enum.EasingDirection.Out,
+	[Enum.PoseEasingDirection.InOut] = Enum.EasingDirection.InOut,
+}
+
+local PriorityValue = {
+	[Enum.AnimationPriority.Core]      = 0,
+	[Enum.AnimationPriority.Idle]      = 1,
+	[Enum.AnimationPriority.Movement]  = 2,
+	[Enum.AnimationPriority.Action]    = 3,
+	[Enum.AnimationPriority.Action2]   = 4,
+	[Enum.AnimationPriority.Action3]   = 5,
+	[Enum.AnimationPriority.Action4]   = 6,
+}
+
+local RigControllers = {}
+local AnimationCache = {}
+
+local function DestroyExistingAnimator(model)
+	if not model then return end
+	local anim = model:FindFirstChildWhichIsA("Animator")
+	if anim then anim:Destroy() return end
+
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if hum then
+		anim = hum:FindFirstChildWhichIsA("Animator")
+		if anim then anim:Destroy() return end
+	end
+
+	for _, desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("Animator") then
+			desc:Destroy()
+			return
+		end
+	end
+end
+
+local function GetOrCreateController(model)
+	if RigControllers[model] then return RigControllers[model] end
+
+	local controller = { Tracks = {} }
+
+	controller.Connection = RunService.Heartbeat:Connect(function()
+		if not model or not model.Parent then
+			if controller.Connection then controller.Connection:Disconnect() end
+			RigControllers[model] = nil
+			return
+		end
+
+		local now = os.clock()
+
+		for _, track in ipairs(controller.Tracks) do
+			if track.IsPlaying then
+				local spd = track.Speed or 1
+				local delta = (now - track._lastUpdateClock) * spd
+				track._timePosition = track._timePosition + delta
+				track._lastUpdateClock = now
+
+				if track.Looped then
+					if track.Length > 0 then
+						track._timePosition = track._timePosition % track.Length
+					end
+				else
+					if track._timePosition >= track.Length then
+						track._timePosition = track.Length
+						track.IsPlaying = false
+					end
+				end
+			end
+		end
+
+		local jointContributions = {}
+
+		for _, track in ipairs(controller.Tracks) do
+			if track.IsPlaying and (track.Weight or 1) > 0 and track._jointData then
+				local timePos = track._timePosition
+				local tWeight = track.Weight or 1
+				local tPrio = PriorityValue[track.Priority] or 3
+
+				for jointName, poses in pairs(track._jointData) do
+					if #poses == 0 then continue end
+
+					local lastPose = poses[1]
+					local nextPose = poses[1]
+					for i = 1, #poses - 1 do
+						if timePos >= poses[i].time and timePos < poses[i + 1].time then
+							lastPose = poses[i]
+							nextPose = poses[i + 1]
+							break
+						end
+					end
+					if timePos >= poses[#poses].time then
+						lastPose = poses[#poses]
+						nextPose = poses[#poses]
+					end
+
+					local alpha = 0
+					if nextPose.time > lastPose.time then
+						alpha = (timePos - lastPose.time) / (nextPose.time - lastPose.time)
+					end
+
+					local eased = TweenService:GetValue(alpha,
+						EasingStyleMap[nextPose.style] or Enum.EasingStyle.Linear,
+						EasingDirectionMap[nextPose.dir] or Enum.EasingDirection.InOut)
+
+					local finalCF = lastPose.cframe:Lerp(nextPose.cframe, eased)
+
+					if not jointContributions[jointName] then
+						jointContributions[jointName] = {}
+					end
+					table.insert(jointContributions[jointName], {
+						priority = tPrio, weight = tWeight, cframe = finalCF,
+						joint = lastPose.joint, jtype = lastPose.jtype
+					})
+				end
+			end
+		end
+
+		for jointName, contribs in pairs(jointContributions) do
+			if #contribs == 0 then continue end
+
+			local maxPrio = contribs[1].priority
+			for _, c in ipairs(contribs) do if c.priority > maxPrio then maxPrio = c.priority end end
+
+			local top = {}
+			for _, c in ipairs(contribs) do if c.priority == maxPrio then table.insert(top, c) end end
+
+			local finalCF
+			if #top == 1 then
+				finalCF = top[1].cframe
+			else
+				finalCF = top[1].cframe
+				local wsum = top[1].weight
+				for i = 2, #top do
+					local c = top[i]
+					local alpha = c.weight / (wsum + c.weight)
+					finalCF = finalCF:Lerp(c.cframe, alpha)
+					wsum = wsum + c.weight
+				end
+			end
+
+			local sample = top[1]
+			if sample.jtype == "Motor6D" or sample.jtype == "Bone" then
+				sample.joint.Transform = finalCF
+			end
+		end
+	end)
+
+	RigControllers[model] = controller
+	return controller
+end
+
+local function PlayKeyframeSequence(Model, KeyframeSequence, SpeedMult)
+	SpeedMult = SpeedMult or 1
+	if not Model or not KeyframeSequence then return nil end
+
+	DestroyExistingAnimator(Model)
+
+	local initialSpeed = SpeedMult
+	local cached = AnimationCache[KeyframeSequence.Name]
+	local keyframes, rawLength, jointData
+
+	if not cached then
+		keyframes = {}
+		for _, kf in ipairs(KeyframeSequence:GetKeyframes()) do
+			table.insert(keyframes, {Time = kf.Time, KF = kf})
+		end
+		table.sort(keyframes, function(a,b) return a.Time < b.Time end)
+		if #keyframes == 0 then return nil end
+		rawLength = keyframes[#keyframes].Time
+	else
+		rawLength = cached.Length
+	end
+
+	if cached then
+		local saved = cached.Data
+		jointData = {}
+		local motorMap = {}
+		local boneMap = {}
+
+		local function ResolveJoint(name)
+			if motorMap[name] then return motorMap[name], "Motor6D" end
+			if boneMap[name] then return boneMap[name], "Bone" end
+
+			for _, v in ipairs(Model:GetDescendants()) do
+				if v:IsA("Motor6D") and v.Part1 and v.Part1.Name == name then
+					motorMap[name] = v
+					return v, "Motor6D"
+				elseif v:IsA("Bone") and v.Name == name then
+					boneMap[name] = v
+					return v, "Bone"
+				end
+			end
+		end
+
+		for jointName, poses in pairs(saved) do
+			jointData[jointName] = {}
+			for _, pose in ipairs(poses) do
+				local joint, jtype = ResolveJoint(jointName)
+				if joint then
+					table.insert(jointData[jointName], {
+						time = pose.time, cframe = pose.cframe,
+						style = pose.style, dir = pose.dir,
+						joint = joint, jtype = jtype
+					})
+				end
+			end
+		end
+	else
+		jointData = {}
+		local motorMap = {}
+		local boneMap = {}
+
+		local function ResolveJoint(pose)
+			local name = pose.Name
+			if motorMap[name] then return motorMap[name], "Motor6D" end
+			if boneMap[name] then return boneMap[name], "Bone" end
+
+			for _, v in ipairs(Model:GetDescendants()) do
+				if v:IsA("Motor6D") and v.Part1 and v.Part1.Name == name then
+					motorMap[name] = v
+					return v, "Motor6D"
+				elseif v:IsA("Bone") and v.Name == name then
+					boneMap[name] = v
+					return v, "Bone"
+				end
+			end
+		end
+
+		for _, entry in ipairs(keyframes) do
+			for _, pose in ipairs(entry.KF:GetDescendants()) do
+				if pose:IsA("Pose") and pose.Weight > 0 then
+					local joint, jtype = ResolveJoint(pose)
+					if joint then
+						if not jointData[pose.Name] then jointData[pose.Name] = {} end
+						table.insert(jointData[pose.Name], {
+							time = entry.Time, cframe = pose.CFrame,
+							style = pose.EasingStyle, dir = pose.EasingDirection,
+							joint = joint, jtype = jtype
+						})
+					end
+				end
+			end
+		end
+
+		local save = {}
+		for jointName, poses in pairs(jointData) do
+			save[jointName] = {}
+			for _, pose in ipairs(poses) do
+				table.insert(save[jointName], {
+					time = pose.time, cframe = pose.cframe,
+					style = pose.style, dir = pose.dir
+				})
+			end
+		end
+
+		AnimationCache[KeyframeSequence.Name] = { Length = rawLength, Data = save }
+	end
+
+	local controller = GetOrCreateController(Model)
+	local track = {
+		Length = rawLength, Weight = 1, Priority = Enum.AnimationPriority.Action,
+		Looped = true, IsPlaying = false, Speed = initialSpeed, Model = Model,
+		_jointData = jointData, _timePosition = 0, _lastUpdateClock = os.clock(),
+
+		Play = function(self, speed)
+			if speed then self.Speed = speed end
+			if not self.IsPlaying then self.IsPlaying = true; self._lastUpdateClock = os.clock() end
+		end,
+		Stop = function(self) self.IsPlaying = false end,
+		AdjustSpeed = function(self, newSpeed) self.Speed = newSpeed or 1 end,
+		SetTimePosition = function(self, t) self._timePosition = math.clamp(t or 0, 0, self.Length) end,
+		GetTimePosition = function(self) return self._timePosition end,
+		RestoreAnimator = function(self)
+			local m = self.Model
+			if not m then return nil end
+			local existing = m:FindFirstChildWhichIsA("Animator")
+			if existing then return existing end
+			local hum = m:FindFirstChildOfClass("Humanoid")
+			if hum then
+				existing = hum:FindFirstChildWhichIsA("Animator")
+				if existing then return existing end
+			end
+			local animator = Instance.new("Animator")
+			animator.Parent = hum or m
+			return animator
+		end,
+	}
+
+	setmetatable(track, {
+		__index = function(self, k) if k == "TimePosition" then return self._timePosition end return rawget(self, k) end,
+		__newindex = function(self, k, v)
+			if k == "TimePosition" then self._timePosition = math.clamp(v or 0, 0, self.Length) else rawset(self, k, v) end
+		end,
+	})
+
+	table.insert(controller.Tracks, track)
+	track.IsPlaying = true
+	track._lastUpdateClock = os.clock()
+
+	return track
+end
+
+getgenv().PlayKeyframeSequence = PlayKeyframeSequence
+
+local GetAsset = getcustomasset or getsynasset
+local isfile = isfile or function(file) return false end
+local writefile = writefile or function(file, data) end
+
+local function LoadAssetFromURL(fileName, url)
+	if not isfile(fileName) then writefile(fileName, game:HttpGet(url)) end
+	local objects = game:GetObjects(GetAsset(fileName))
+	local kfSequence = nil
+	local loadedFolder = Instance.new("Folder")
+	loadedFolder.Name = "LoadedAssets_" .. fileName
+	loadedFolder.Parent = workspace
+	for _, obj in ipairs(objects) do
+		obj.Parent = loadedFolder
+		if obj:IsA("KeyframeSequence") then 
+			kfSequence = obj 
+		elseif obj:FindFirstChildWhichIsA("KeyframeSequence", true) then
+			kfSequence = obj:FindFirstChildWhichIsA("KeyframeSequence", true)
+		end
+	end
+	return kfSequence
+end
+
+local isAnimating = false
+local LiuKangAnim = nil
+local VictimAnim = nil
+local SFXFileName = "LiuSFX.mp3"
+
+task.spawn(function()
+	LiuKangAnim = LoadAssetFromURL("LiuKangAnim.rbxmx", "https://github.com/Scripterblabla/Made-By-Scripterblabla-/raw/refs/heads/main/Liu%20Kang%20Wc.Rbxmx")
+	VictimAnim = LoadAssetFromURL("VictimAnimLK.rbxmx", "https://github.com/Scripterblabla/Made-By-Scripterblabla-/raw/refs/heads/main/Dummy%20Animation.Rbxmx")
+	
+	if not isfile(SFXFileName) then
+		writefile(SFXFileName, game:HttpGet("https://github.com/Scripterblabla/FECLIENT/raw/refs/heads/main/Liu%20Lol%20SFX.mp3"))
+	end
+end)
+
+local function CreateDummy(myChar)
+	myChar.Archivable = true
+	local dummy = myChar:Clone()
+	dummy.Name = "LiuKangDummy"
+	
+	for _, v in ipairs(dummy:GetDescendants()) do
+		if v:IsA("Script") or v:IsA("LocalScript") or v:IsA("Tool") or v:IsA("Sound") or v:IsA("ParticleEmitter") then
+			v:Destroy() 
+		elseif v:IsA("Accessory") or v:IsA("Shirt") or v:IsA("Pants") or v:IsA("ShirtGraphic") or v:IsA("CharacterMesh") then
+			v:Destroy()
+		elseif v:IsA("BasePart") then
+			v.Anchored = false
+			v.CanCollide = false
+			if v.Name ~= "HumanoidRootPart" then
+				v.Material = Enum.Material.SmoothPlastic
+				v.Color = Color3.fromRGB(163, 162, 165)
+			end
+		elseif v:IsA("Decal") and v.Name ~= "face" then
+			v:Destroy()
+		end
+	end
+	
+	local hum = dummy:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+		hum.Health = hum.MaxHealth
+	end
+	
+	dummy.Parent = workspace
+	return dummy
+end
+
+local function CreateElementalVFX(character)
+	local activeEffects = {}
+	
+	local function getPart(name1, name2)
+		return character:FindFirstChild(name1) or character:FindFirstChild(name2)
+	end
+	
+	local rightArm = getPart("RightHand", "Right Arm")
+	local leftArm = getPart("LeftHand", "Left Arm")
+	local rightFoot = getPart("RightFoot", "Right Leg")
+	local leftFoot = getPart("LeftFoot", "Left Leg")
+	
+	local function addFire(part)
+		if not part then return end
+		local att = Instance.new("Attachment")
+		att.Parent = part
+		
+		local emit = Instance.new("ParticleEmitter")
+		emit.Texture = "rbxasset://textures/particles/fire_main.dds"
+		emit.Color = ColorSequence.new(Color3.fromRGB(255, 100, 0), Color3.fromRGB(255, 0, 0))
+		emit.LightEmission = 1
+		emit.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 1.2), NumberSequenceKeypoint.new(1, 0)})
+		emit.Rate = 50
+		emit.Lifetime = NumberRange.new(0.4, 0.6)
+		emit.Speed = NumberRange.new(1, 2)
+		emit.Parent = att
+		
+		table.insert(activeEffects, att)
+	end
+	
+	local function addIce(part)
+		if not part then return end
+		local att = Instance.new("Attachment")
+		
+		local isR6 = (part.Name == "Right Leg" or part.Name == "Left Leg")
+		att.Position = isR6 and Vector3.new(0, -1, 0) or Vector3.new(0, -0.5, 0)
+		att.Parent = part
+		
+		local emit = Instance.new("ParticleEmitter")
+		emit.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+		emit.Color = ColorSequence.new(Color3.fromRGB(150, 200, 255), Color3.fromRGB(200, 255, 255))
+		emit.LightEmission = 0.5
+		emit.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.7), NumberSequenceKeypoint.new(1, 0)})
+		emit.Rate = 15       
+		emit.Lifetime = NumberRange.new(0.3, 0.5)
+		emit.Speed = NumberRange.new(0.5, 1)
+		emit.SpreadAngle = Vector2.new(45, 45)
+		emit.Parent = att
+		
+		table.insert(activeEffects, att)
+	end
+	
+	addFire(rightArm)
+	addFire(leftArm)
+	addIce(rightFoot)
+	addIce(leftFoot)
+	
+	return activeEffects
+end
+
+local function SetupLiuKangTool()
+	local Backpack = LocalPlayer:WaitForChild("Backpack")
+	if Backpack:FindFirstChild("Liu Kang") or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Liu Kang")) then return end
+	
+	local Tool = Instance.new("Tool")
+	Tool.Name = "Liu Kang"
+	Tool.RequiresHandle = false
+	Tool.Parent = Backpack
+
+	Tool.Activated:Connect(function()
+		if isAnimating or not LiuKangAnim or not VictimAnim then return end
+		local myChar = LocalPlayer.Character
+		local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+		local myHead = myChar and myChar:FindFirstChild("Head")
+		local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+		
+		if not myHRP or not myHead or not myHum then return end
+
+		isAnimating = true
+		myHRP.Anchored = true
+
+		local originalCamSubject = CurrentCamera.CameraSubject
+		CurrentCamera.CameraSubject = myHead
+		
+		local LKSound = Instance.new("Sound")
+		LKSound.SoundId = GetAsset(SFXFileName)
+		LKSound.Parent = myHRP
+		LKSound.Volume = 2
+		
+		LKSound.RollOffMode = Enum.RollOffMode.Linear
+		LKSound.RollOffMinDistance = 100 
+		LKSound.RollOffMaxDistance = 10000 
+		LKSound:Play()
+		
+		local victimChar = CreateDummy(myChar)
+		local victimHRP = victimChar:FindFirstChild("HumanoidRootPart")
+		
+		local activeVFX = CreateElementalVFX(myChar)
+		
+		if victimChar and victimHRP then
+			victimHRP.Anchored = true
+
+			local lockConnection
+			lockConnection = RunService.Heartbeat:Connect(function()
+				if victimHRP and myHRP and isAnimating then
+					local spawnPos = (myHRP.CFrame * CFrame.new(CONFIG.OffsetX, CONFIG.OffsetY, CONFIG.DistanceZ)).Position
+					local lookAtPos = Vector3.new(myHRP.Position.X, spawnPos.Y, myHRP.Position.Z)
+					local baseLookAt = CFrame.lookAt(spawnPos, lookAtPos)
+					victimHRP.CFrame = baseLookAt * CFrame.Angles(0, math.rad(CONFIG.RotationY), 0)
+				end
+			end)
+			
+			task.spawn(function()
+				local victimTrack = PlayKeyframeSequence(victimChar, VictimAnim, 1)
+				if victimTrack then
+					victimTrack.Priority = Enum.AnimationPriority.Action4
+					victimTrack.Looped = false
+					task.wait(victimTrack.Length)
+				else
+					task.wait(3)
+				end
+				
+				if lockConnection then lockConnection:Disconnect() end
+				victimChar:Destroy()
+			end)
+		end
+
+		local track = PlayKeyframeSequence(myChar, LiuKangAnim, 1)
+		if track then
+			track.Priority = Enum.AnimationPriority.Action4
+			track.Looped = false 
+			task.wait(track.Length)
+			track:Stop()
+			track:RestoreAnimator()
+		else
+			task.wait(3)
+		end
+		
+		if originalCamSubject then
+			CurrentCamera.CameraSubject = originalCamSubject
+		end
+		
+		myHRP.Anchored = false
+		isAnimating = false
+		
+		if LKSound then LKSound:Destroy() end
+		for _, vfx in ipairs(activeVFX) do
+			if vfx then vfx:Destroy() end
+		end
+	end)
+end
+
+SetupLiuKangTool()
+
+LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(1)
+	SetupLiuKangTool()
+end)
+
